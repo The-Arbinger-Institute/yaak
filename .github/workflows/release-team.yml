@@ -1,0 +1,109 @@
+name: Release Team Binaries
+# Unsigned internal builds for team distribution.
+# Trigger by pushing a tag matching `team-v*` (e.g. `team-v1.2.3`).
+# Produces a draft GitHub Release with installers for macOS arm64, Linux x64, Windows x64.
+
+on:
+  push:
+    tags: [team-v*]
+
+jobs:
+  build-artifacts:
+    permissions:
+      contents: write
+
+    name: Build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: "macos-latest"
+            args: "--target aarch64-apple-darwin"
+            yaak_arch: "arm64"
+            os: "macos"
+            targets: "aarch64-apple-darwin"
+          - platform: "ubuntu-22.04"
+            args: ""
+            yaak_arch: "x64"
+            os: "ubuntu"
+            targets: ""
+          - platform: "windows-latest"
+            args: ""
+            yaak_arch: "x64"
+            os: "windows"
+            targets: ""
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compute version from tag
+        id: version
+        shell: bash
+        run: |
+          # Strip `team-` prefix so YAAK_VERSION ends up like `v1.2.3`.
+          RAW="${{ github.ref_name }}"
+          VERSION="${RAW#team-}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: $VERSION"
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version: "24"
+          cache: true
+
+      - name: install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.targets }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci
+          cache-on-failure: true
+
+      - name: install dependencies (Linux only)
+        if: matrix.os == 'ubuntu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xdg-utils
+
+      - name: Install Protoc for plugin-runtime
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - run: vp install
+      - run: npm run bootstrap
+        env:
+          YAAK_TARGET_ARCH: ${{ matrix.yaak_arch }}
+
+      - name: Set version
+        run: npm run replace-version
+        env:
+          YAAK_VERSION: ${{ steps.version.outputs.version }}
+
+      # Override config disables updater artifacts (needs signing key) and Windows signCommand (needs Azure creds).
+      - name: Write tauri override config
+        shell: bash
+        run: |
+          if [ "${{ matrix.os }}" = "windows" ]; then
+            echo '{"bundle":{"createUpdaterArtifacts":false,"windows":{"signCommand":null}}}' > crates-tauri/yaak-app-client/tauri.team.conf.json
+          else
+            echo '{"bundle":{"createUpdaterArtifacts":false}}' > crates-tauri/yaak-app-client/tauri.team.conf.json
+          fi
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          YAAK_TARGET_ARCH: ${{ matrix.yaak_arch }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "Team Release ${{ steps.version.outputs.version }}"
+          releaseBody: "Internal unsigned build for team distribution. Not for public release."
+          releaseDraft: true
+          prerelease: true
+          projectPath: ./crates-tauri/yaak-app-client
+          args: "${{ matrix.args }} --config ./tauri.release.conf.json --config ./tauri.team.conf.json"
